@@ -40,11 +40,11 @@ include_directories(${CLANG_INCLUDE_DIRS})
 find_package(GTest REQUIRED)
 # ---- GTest setup end ----
 
-add_library(CLAP_JIT
+add_library(clap_rt_core
     src/JIT.cc
 )
 
-target_link_libraries(CLAP_JIT
+target_link_libraries(clap_rt_core
     PUBLIC
 
     #llvm libs
@@ -66,14 +66,29 @@ target_link_libraries(CLAP_JIT
     clangBasic
 )
 
-add_executable(CLAP_RT 
-    src/main.cc
+enable_testing()
+
+add_executable(clap_rt_core_test
+    test/test.cc
 )
 
-target_link_libraries(CLAP_RT
+target_link_libraries(clap_rt_core_test
     PRIVATE
-    CLAP_JIT
+    clap_rt_core
+    GTest::gtest_main
 )
+
+include(GoogleTest)
+gtest_discover_tests(clap_rt_core_test)
+
+# add_executable(CLAP_RT 
+#     src/main.cc
+# )
+
+# target_link_libraries(CLAP_RT
+#     PRIVATE
+#     CLAP_JIT
+# )
 
 
 

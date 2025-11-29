@@ -15,10 +15,12 @@ int main(int argc, char** argv) {
 
     init_llvm();
 
-    auto JIT = ClapJIT();
-    if(auto Err = JIT.initialize()){
-        exitOnErr(std::move(Err));
+    auto JITOrErr = ClapJIT::create();
+    if(!JITOrErr){
+        exitOnErr(JITOrErr.takeError());
     }
+    auto JIT = std::move(*JITOrErr);
+
 
     llvm::outs() << "Compiling file: " << InputFile << " ...\n";
     if(auto Err = JIT.addModule(InputFile)){

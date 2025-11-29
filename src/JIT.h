@@ -16,7 +16,7 @@ inline void init_llvm() {
 
 class ClapJIT {
 private:
-  ClapJIT();
+  ClapJIT(){}
 public:
   static llvm::Expected<ClapJIT> create();
 
