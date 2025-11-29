@@ -1,6 +1,7 @@
 #pragma once
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/Support/Error.h>
 #include <llvm/Support/StringSaver.h>
 #include <llvm/Support/TargetSelect.h>
 #include <memory>
@@ -15,11 +16,11 @@ inline void init_llvm() {
 
 class ClapJIT {
 public:
-  ClapJIT();
+  llvm::Error initialize();
 
-  void compileFileToIR(llvm::StringRef FilePath);
+  llvm::Error addModule(llvm::StringRef FilePath);
+  llvm::Expected<orc::ExecutorAddr> lookup(llvm::StringRef UnmangledName);
 
-  int runAdd(int r, int l);
 
 private:
   std::unique_ptr<llvm::orc::LLJIT> JIT;

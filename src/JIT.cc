@@ -3,20 +3,15 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/Support/Error.h>
 #include <llvm/TargetParser/Host.h>
 
 
-void exitOnErr(llvm::Error Err) {
-    if (Err) {
-        llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "Error: ");
-        exit(1);
-    }
-}
-
-ClapJIT::ClapJIT(){
+llvm::Error ClapJIT::initialize(){
     auto JITOrErr = orc::LLJITBuilder().create();
-    if (!JITOrErr) exitOnErr(JITOrErr.takeError());
+    if (!JITOrErr) return JITOrErr.takeError();
     JIT = std::move(*JITOrErr);
+    return llvm::Error::success();
 }
 
 llvm::Expected<orc::ThreadSafeModule> ClapJIT::tryCompileFileToIR(llvm::StringRef FilePath) {
@@ -63,23 +58,19 @@ llvm::Expected<orc::ThreadSafeModule> ClapJIT::tryCompileFileToIR(llvm::StringRe
   return orc::ThreadSafeModule(std::move(M), std::move(Ctx));
 }
 
-void ClapJIT::compileFileToIR(llvm::StringRef FilePath){
+llvm::Error ClapJIT::addModule(llvm::StringRef FilePath){
     auto TSMOrErr = tryCompileFileToIR(FilePath);
-    if (!TSMOrErr) exitOnErr(TSMOrErr.takeError());
+    if (!TSMOrErr) return TSMOrErr.takeError();
 
-    if (auto Err = JIT->addIRModule(std::move(*TSMOrErr))) {
-        exitOnErr(std::move(Err));
-    }
+    if (auto Err = JIT->addIRModule(std::move(*TSMOrErr)))
+        return Err;
+    return llvm::Error::success();
 }
 
 
-int ClapJIT::runAdd(int r,int l){
-    auto SymOrErr = JIT->lookup("add");
-    if (!SymOrErr) exitOnErr(SymOrErr.takeError());
-
-    orc::ExecutorAddr Addr = *SymOrErr;
-    auto *AddFn = Addr.toPtr<int(int, int)>();
-
-    return AddFn(r,l);
+llvm::Expected<orc::ExecutorAddr> ClapJIT::lookup(llvm::StringRef UnmangledName){
+    return JIT->lookup(UnmangledName);
 }
+
+
 
