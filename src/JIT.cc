@@ -7,11 +7,12 @@
 #include <llvm/TargetParser/Host.h>
 
 
-llvm::Error ClapJIT::initialize(){
+llvm::Expected<ClapJIT> ClapJIT::create(){
+    auto JIT = ClapJIT();
     auto JITOrErr = orc::LLJITBuilder().create();
     if (!JITOrErr) return JITOrErr.takeError();
-    JIT = std::move(*JITOrErr);
-    return llvm::Error::success();
+    JIT.llJIT = std::move(*JITOrErr);
+    return JIT;
 }
 
 llvm::Expected<orc::ThreadSafeModule> ClapJIT::tryCompileFileToIR(llvm::StringRef FilePath) {
@@ -62,14 +63,14 @@ llvm::Error ClapJIT::addModule(llvm::StringRef FilePath){
     auto TSMOrErr = tryCompileFileToIR(FilePath);
     if (!TSMOrErr) return TSMOrErr.takeError();
 
-    if (auto Err = JIT->addIRModule(std::move(*TSMOrErr)))
+    if (auto Err = llJIT->addIRModule(std::move(*TSMOrErr)))
         return Err;
     return llvm::Error::success();
 }
 
 
 llvm::Expected<orc::ExecutorAddr> ClapJIT::lookup(llvm::StringRef UnmangledName){
-    return JIT->lookup(UnmangledName);
+    return llJIT->lookup(UnmangledName);
 }
 
 

@@ -15,15 +15,16 @@ inline void init_llvm() {
 }
 
 class ClapJIT {
+private:
+  ClapJIT();
 public:
-  llvm::Error initialize();
+  static llvm::Expected<ClapJIT> create();
 
   llvm::Error addModule(llvm::StringRef FilePath);
   llvm::Expected<orc::ExecutorAddr> lookup(llvm::StringRef UnmangledName);
 
-
 private:
-  std::unique_ptr<llvm::orc::LLJIT> JIT;
+  std::unique_ptr<llvm::orc::LLJIT> llJIT;
 
   llvm::Expected<orc::ThreadSafeModule> tryCompileFileToIR(llvm::StringRef FilePath);
 };

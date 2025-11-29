@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20.0)
 
 project(CLAP_RT)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 
@@ -40,16 +40,17 @@ include_directories(${CLANG_INCLUDE_DIRS})
 find_package(GTest REQUIRED)
 # ---- GTest setup end ----
 
-add_executable(CLAP_RT 
-    src/main.cc
+add_library(CLAP_JIT
     src/JIT.cc
 )
 
-target_link_libraries(CLAP_RT
-    PRIVATE
+target_link_libraries(CLAP_JIT
+    PUBLIC
 
     #llvm libs
     ${llvm_libs}
+
+    PRIVATE
     
     # clang libs
     clangFrontend
@@ -64,5 +65,15 @@ target_link_libraries(CLAP_RT
     clangLex
     clangBasic
 )
+
+add_executable(CLAP_RT 
+    src/main.cc
+)
+
+target_link_libraries(CLAP_RT
+    PRIVATE
+    CLAP_JIT
+)
+
 
 
