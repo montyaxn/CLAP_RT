@@ -18,16 +18,18 @@ inline void init_llvm() {
 
 class ClapJIT {
 private:
-  ClapJIT(){}
+  ClapJIT() {}
+
 public:
   static llvm::Expected<ClapJIT> create();
 
   llvm::Error addModule(llvm::StringRef FilePath);
+  llvm::Error addModule(std::vector<llvm::StringRef> FilePaths);
   llvm::Expected<orc::ExecutorAddr> lookup(llvm::StringRef UnmangledName);
 
 private:
   std::unique_ptr<llvm::orc::LLJIT> llJIT;
 
-  llvm::Expected<std::unique_ptr<llvm::Module>> compileSingleFile(llvm::StringRef FilePath,llvm::LLVMContext* Ctx);
-  llvm::Expected<orc::ThreadSafeModule> tryCompileFileToIR(std::vector<llvm::StringRef> FilePaths);
+  llvm::Expected<std::unique_ptr<llvm::Module>>
+  compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext *Ctx);
 };
