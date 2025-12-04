@@ -1,6 +1,8 @@
 #pragma once
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/StringSaver.h>
 #include <llvm/Support/TargetSelect.h>
@@ -26,5 +28,6 @@ public:
 private:
   std::unique_ptr<llvm::orc::LLJIT> llJIT;
 
-  llvm::Expected<orc::ThreadSafeModule> tryCompileFileToIR(llvm::StringRef FilePath);
+  llvm::Expected<std::unique_ptr<llvm::Module>> compileSingleFile(llvm::StringRef FilePath,llvm::LLVMContext* Ctx);
+  llvm::Expected<orc::ThreadSafeModule> tryCompileFileToIR(std::vector<llvm::StringRef> FilePaths);
 };
