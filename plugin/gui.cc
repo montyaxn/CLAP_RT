@@ -1,9 +1,14 @@
 #include "gui.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <GL/gl.h>
+#else
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <GL/glx.h>
 #include <GL/gl.h>
+#endif
 
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
@@ -15,13 +20,128 @@
 namespace gui {
 
 // ============================================================================
-// X11/Display Management
+// Platform-specific globals and helpers
 // ============================================================================
+
+#ifdef _WIN32
+
+static int g_instance_count = 0;
+static const char *WINDOW_CLASS_NAME = "RT_CLAP_GUI";
+static bool g_class_registered = false;
+
+static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  PluginGui *gui = (PluginGui *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+
+  if (gui && gui->imgui_ctx) {
+    ImGui::SetCurrentContext(gui->imgui_ctx);
+    ImGuiIO &io = ImGui::GetIO();
+
+    switch (msg) {
+      case WM_MOUSEMOVE:
+        io.MousePos = ImVec2((float)LOWORD(lParam), (float)HIWORD(lParam));
+        break;
+      case WM_LBUTTONDOWN:
+        io.MouseDown[0] = true;
+        SetCapture(hwnd);
+        break;
+      case WM_LBUTTONUP:
+        io.MouseDown[0] = false;
+        ReleaseCapture();
+        break;
+      case WM_SIZE:
+        gui->width = LOWORD(lParam);
+        gui->height = HIWORD(lParam);
+        io.DisplaySize = ImVec2((float)gui->width, (float)gui->height);
+        break;
+    }
+  }
+
+  return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static bool register_window_class() {
+  if (g_class_registered)
+    return true;
+
+  WNDCLASSEX wc = {};
+  wc.cbSize = sizeof(WNDCLASSEX);
+  wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+  wc.lpfnWndProc = WindowProc;
+  wc.hInstance = GetModuleHandle(nullptr);
+  wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  wc.lpszClassName = WINDOW_CLASS_NAME;
+
+  if (!RegisterClassEx(&wc))
+    return false;
+
+  g_class_registered = true;
+  return true;
+}
+
+static bool create_win32_window(PluginGui *gui, HWND parent) {
+  gui->hwnd = CreateWindowEx(
+      0, WINDOW_CLASS_NAME, "RT_CLAP",
+      WS_CHILD | WS_VISIBLE,
+      0, 0, gui->width, gui->height,
+      parent, nullptr, GetModuleHandle(nullptr), nullptr);
+
+  if (!gui->hwnd)
+    return false;
+
+  SetWindowLongPtr(gui->hwnd, GWLP_USERDATA, (LONG_PTR)gui);
+
+  // Create OpenGL context
+  gui->hdc = GetDC(gui->hwnd);
+
+  PIXELFORMATDESCRIPTOR pfd = {};
+  pfd.nSize = sizeof(pfd);
+  pfd.nVersion = 1;
+  pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+  pfd.iPixelType = PFD_TYPE_RGBA;
+  pfd.cColorBits = 32;
+  pfd.cDepthBits = 24;
+
+  int format = ChoosePixelFormat(gui->hdc, &pfd);
+  if (!format) {
+    ReleaseDC(gui->hwnd, gui->hdc);
+    DestroyWindow(gui->hwnd);
+    gui->hwnd = nullptr;
+    return false;
+  }
+
+  SetPixelFormat(gui->hdc, format, &pfd);
+
+  gui->hglrc = wglCreateContext(gui->hdc);
+  if (!gui->hglrc) {
+    ReleaseDC(gui->hwnd, gui->hdc);
+    DestroyWindow(gui->hwnd);
+    gui->hwnd = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+static void init_imgui(PluginGui *gui) {
+  wglMakeCurrent(gui->hdc, gui->hglrc);
+
+  IMGUI_CHECKVERSION();
+  gui->imgui_ctx = ImGui::CreateContext();
+  ImGui::SetCurrentContext(gui->imgui_ctx);
+
+  ImGuiIO &io = ImGui::GetIO();
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  io.DisplaySize = ImVec2((float)gui->width, (float)gui->height);
+
+  ImGui::StyleColorsDark();
+  ImGui_ImplOpenGL3_Init("#version 120");
+}
+
+#else // Linux/X11
 
 static Display *g_display = nullptr;
 static int g_instance_count = 0;
 
-/// Opens the X11 display connection if not already open.
 static bool init_x11() {
   if (g_display)
     return true;
@@ -29,7 +149,6 @@ static bool init_x11() {
   return g_display != nullptr;
 }
 
-/// Closes the X11 display connection when no more instances exist.
 static void shutdown_x11() {
   if (g_display && g_instance_count == 0) {
     XCloseDisplay(g_display);
@@ -37,43 +156,6 @@ static void shutdown_x11() {
   }
 }
 
-/// Scans subdirectories for .cc files and populates dsp_files list.
-/// Files are stored as "folder/file.cc" format.
-void scan_dsp_files(PluginGui *gui, const char *dir) {
-  gui->dsp_files.clear();
-  gui->selected_file_index = 0;
-
-  std::error_code ec;
-  std::filesystem::path base_dir(dir);
-
-  // Scan each subdirectory (local/, @username/, etc.) but skip lib/
-  for (const auto &subdir : std::filesystem::directory_iterator(base_dir, ec)) {
-    if (!subdir.is_directory()) continue;
-
-    std::string folder_name = subdir.path().filename().string();
-    if (folder_name == "lib") continue;  // lib/ is for shared code, not DSP files
-
-    for (const auto &file : std::filesystem::directory_iterator(subdir.path(), ec)) {
-      if (file.path().extension() == ".cc") {
-        std::string relative_path = folder_name + "/" + file.path().filename().string();
-        gui->dsp_files.push_back(relative_path);
-      }
-    }
-  }
-
-  std::sort(gui->dsp_files.begin(), gui->dsp_files.end());
-
-  // Default to "local/gain.cc" if it exists
-  for (size_t i = 0; i < gui->dsp_files.size(); i++) {
-    if (gui->dsp_files[i] == "local/gain.cc") {
-      gui->selected_file_index = static_cast<int>(i);
-      break;
-    }
-  }
-}
-
-/// Creates an X11 child window with GLX context.
-/// Returns true on success, false on failure.
 static bool create_x11_window(PluginGui *gui, Window parent) {
   static int visual_attribs[] = {
     GLX_RGBA,
@@ -118,7 +200,6 @@ static bool create_x11_window(PluginGui *gui, Window parent) {
   return true;
 }
 
-/// Initializes ImGui with OpenGL backend.
 static void init_imgui(PluginGui *gui) {
   glXMakeCurrent(g_display, gui->window, gui->glx_context);
 
@@ -134,21 +215,91 @@ static void init_imgui(PluginGui *gui) {
   ImGui_ImplOpenGL3_Init("#version 120");
 }
 
+static void process_x11_events(PluginGui *gui) {
+  while (XPending(g_display)) {
+    XEvent event;
+    XNextEvent(g_display, &event);
+
+    ImGuiIO &io = ImGui::GetIO();
+
+    switch (event.type) {
+      case ButtonPress:
+        if (event.xbutton.button == Button1)
+          io.MouseDown[0] = true;
+        break;
+      case ButtonRelease:
+        if (event.xbutton.button == Button1)
+          io.MouseDown[0] = false;
+        break;
+      case MotionNotify:
+        io.MousePos = ImVec2((float)event.xmotion.x, (float)event.xmotion.y);
+        break;
+      case ConfigureNotify:
+        gui->width = event.xconfigure.width;
+        gui->height = event.xconfigure.height;
+        io.DisplaySize = ImVec2((float)gui->width, (float)gui->height);
+        break;
+    }
+  }
+}
+
+#endif // _WIN32
+
+// ============================================================================
+// Platform-independent code
+// ============================================================================
+
+void scan_dsp_files(PluginGui *gui, const char *dir) {
+  gui->dsp_files.clear();
+  gui->selected_file_index = 0;
+
+  std::error_code ec;
+  std::filesystem::path base_dir(dir);
+
+  for (const auto &subdir : std::filesystem::directory_iterator(base_dir, ec)) {
+    if (!subdir.is_directory()) continue;
+
+    std::string folder_name = subdir.path().filename().string();
+    if (folder_name == "lib") continue;
+
+    for (const auto &file : std::filesystem::directory_iterator(subdir.path(), ec)) {
+      if (file.path().extension() == ".cc") {
+        std::string relative_path = folder_name + "/" + file.path().filename().string();
+        gui->dsp_files.push_back(relative_path);
+      }
+    }
+  }
+
+  std::sort(gui->dsp_files.begin(), gui->dsp_files.end());
+
+  for (size_t i = 0; i < gui->dsp_files.size(); i++) {
+    if (gui->dsp_files[i] == "local/gain.cc") {
+      gui->selected_file_index = static_cast<int>(i);
+      break;
+    }
+  }
+}
+
 // ============================================================================
 // CLAP GUI Extension Callbacks
 // ============================================================================
 
-bool is_api_supported(const clap_plugin_t *plugin, const char *api,
-                      bool is_floating) {
+bool is_api_supported(const clap_plugin_t *plugin, const char *api, bool is_floating) {
   (void)plugin;
-  // Only support embedded X11 windows
+#ifdef _WIN32
+  return strcmp(api, CLAP_WINDOW_API_WIN32) == 0 && !is_floating;
+#else
   return strcmp(api, CLAP_WINDOW_API_X11) == 0 && !is_floating;
+#endif
 }
 
-bool get_preferred_api(const clap_plugin_t *plugin, const char **api,
-                       bool *is_floating) {
+bool get_preferred_api(const clap_plugin_t *plugin, const char **api, bool *is_floating) {
   (void)plugin;
+#ifdef _WIN32
+  *api = CLAP_WINDOW_API_WIN32;
+#else
   *api = CLAP_WINDOW_API_X11;
+#endif
   *is_floating = false;
   return true;
 }
@@ -156,6 +307,20 @@ bool get_preferred_api(const clap_plugin_t *plugin, const char **api,
 bool create(const clap_plugin_t *plugin, const char *api, bool is_floating) {
   (void)is_floating;
 
+#ifdef _WIN32
+  if (strcmp(api, CLAP_WINDOW_API_WIN32) != 0)
+    return false;
+
+  auto *gui = get_gui(plugin);
+  if (!gui)
+    return false;
+
+  if (!register_window_class())
+    return false;
+
+  g_instance_count++;
+  return true;
+#else
   if (strcmp(api, CLAP_WINDOW_API_X11) != 0)
     return false;
 
@@ -168,6 +333,7 @@ bool create(const clap_plugin_t *plugin, const char *api, bool is_floating) {
 
   g_instance_count++;
   return true;
+#endif
 }
 
 void destroy(const clap_plugin_t *plugin) {
@@ -175,6 +341,23 @@ void destroy(const clap_plugin_t *plugin) {
   if (!gui)
     return;
 
+#ifdef _WIN32
+  if (gui->hglrc) {
+    wglMakeCurrent(nullptr, nullptr);
+    wglDeleteContext(gui->hglrc);
+    gui->hglrc = nullptr;
+  }
+
+  if (gui->hdc && gui->hwnd) {
+    ReleaseDC(gui->hwnd, gui->hdc);
+    gui->hdc = nullptr;
+  }
+
+  if (gui->hwnd) {
+    DestroyWindow(gui->hwnd);
+    gui->hwnd = nullptr;
+  }
+#else
   if (gui->glx_context) {
     glXMakeCurrent(g_display, None, nullptr);
     glXDestroyContext(g_display, gui->glx_context);
@@ -185,6 +368,7 @@ void destroy(const clap_plugin_t *plugin) {
     XDestroyWindow(g_display, gui->window);
     gui->window = 0;
   }
+#endif
 
   if (gui->imgui_ctx) {
     ImGui::SetCurrentContext(gui->imgui_ctx);
@@ -194,9 +378,11 @@ void destroy(const clap_plugin_t *plugin) {
   }
 
   g_instance_count--;
+#ifndef _WIN32
   if (g_instance_count == 0) {
     shutdown_x11();
   }
+#endif
 }
 
 bool set_scale(const clap_plugin_t *plugin, double scale) {
@@ -236,26 +422,41 @@ bool set_size(const clap_plugin_t *plugin, uint32_t width, uint32_t height) {
   gui->width = width;
   gui->height = height;
 
+#ifdef _WIN32
+  if (gui->hwnd) {
+    SetWindowPos(gui->hwnd, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER);
+  }
+#else
   if (gui->window && g_display) {
     XResizeWindow(g_display, gui->window, width, height);
   }
+#endif
   return true;
 }
 
-/// Creates an X11 child window inside the host's parent window.
-/// Called by the host after create() to provide the parent window handle.
 bool set_parent(const clap_plugin_t *plugin, const clap_window_t *window) {
+  auto *gui = get_gui(plugin);
+  if (!gui)
+    return false;
+
+#ifdef _WIN32
+  if (!window || strcmp(window->api, CLAP_WINDOW_API_WIN32) != 0)
+    return false;
+
+  HWND parent = (HWND)window->win32;
+  if (!create_win32_window(gui, parent))
+    return false;
+#else
   if (!window || strcmp(window->api, CLAP_WINDOW_API_X11) != 0)
     return false;
 
-  auto *gui = get_gui(plugin);
-  if (!gui || !g_display)
+  if (!g_display)
     return false;
 
   Window parent = (Window)window->x11;
-
   if (!create_x11_window(gui, parent))
     return false;
+#endif
 
   init_imgui(gui);
   return true;
@@ -274,11 +475,20 @@ void suggest_title(const clap_plugin_t *plugin, const char *title) {
 
 bool show(const clap_plugin_t *plugin) {
   auto *gui = get_gui(plugin);
-  if (!gui || !gui->window || !g_display)
+  if (!gui)
     return false;
 
+#ifdef _WIN32
+  if (!gui->hwnd)
+    return false;
+  ShowWindow(gui->hwnd, SW_SHOW);
+#else
+  if (!gui->window || !g_display)
+    return false;
   XMapWindow(g_display, gui->window);
   XFlush(g_display);
+#endif
+
   gui->visible = true;
 
   // Register timer for rendering (~30fps)
@@ -295,7 +505,7 @@ bool show(const clap_plugin_t *plugin) {
 
 bool hide(const clap_plugin_t *plugin) {
   auto *gui = get_gui(plugin);
-  if (!gui || !gui->window || !g_display)
+  if (!gui)
     return false;
 
   // Unregister timer
@@ -308,8 +518,17 @@ bool hide(const clap_plugin_t *plugin) {
     }
   }
 
+#ifdef _WIN32
+  if (!gui->hwnd)
+    return false;
+  ShowWindow(gui->hwnd, SW_HIDE);
+#else
+  if (!gui->window || !g_display)
+    return false;
   XUnmapWindow(g_display, gui->window);
   XFlush(g_display);
+#endif
+
   gui->visible = false;
   return true;
 }
@@ -318,36 +537,6 @@ bool hide(const clap_plugin_t *plugin) {
 // Rendering
 // ============================================================================
 
-/// Processes pending X11 events and updates ImGui input state.
-static void process_x11_events(PluginGui *gui) {
-  while (XPending(g_display)) {
-    XEvent event;
-    XNextEvent(g_display, &event);
-
-    ImGuiIO &io = ImGui::GetIO();
-
-    switch (event.type) {
-      case ButtonPress:
-        if (event.xbutton.button == Button1)
-          io.MouseDown[0] = true;
-        break;
-      case ButtonRelease:
-        if (event.xbutton.button == Button1)
-          io.MouseDown[0] = false;
-        break;
-      case MotionNotify:
-        io.MousePos = ImVec2((float)event.xmotion.x, (float)event.xmotion.y);
-        break;
-      case ConfigureNotify:
-        gui->width = event.xconfigure.width;
-        gui->height = event.xconfigure.height;
-        io.DisplaySize = ImVec2((float)gui->width, (float)gui->height);
-        break;
-    }
-  }
-}
-
-/// Draws the ImGui interface content.
 static void draw_gui_content(PluginGui *gui) {
   ImGui::SetNextWindowPos(ImVec2(0, 0));
   ImGui::SetNextWindowSize(ImVec2((float)gui->width, (float)gui->height));
@@ -445,16 +634,31 @@ static void draw_gui_content(PluginGui *gui) {
   ImGui::End();
 }
 
-/// Renders one frame of the ImGui interface.
-/// Called from the host's timer callback at ~30fps.
 void render(PluginGui *gui) {
-  if (!gui || !gui->window || !gui->visible || !gui->glx_context || !g_display)
+  if (!gui || !gui->visible || !gui->imgui_ctx)
+    return;
+
+#ifdef _WIN32
+  if (!gui->hwnd || !gui->hglrc)
+    return;
+
+  // Process Windows messages
+  MSG msg;
+  while (PeekMessage(&msg, gui->hwnd, 0, 0, PM_REMOVE)) {
+    TranslateMessage(&msg);
+    DispatchMessage(&msg);
+  }
+
+  wglMakeCurrent(gui->hdc, gui->hglrc);
+#else
+  if (!gui->window || !gui->glx_context || !g_display)
     return;
 
   glXMakeCurrent(g_display, gui->window, gui->glx_context);
-  ImGui::SetCurrentContext(gui->imgui_ctx);
-
   process_x11_events(gui);
+#endif
+
+  ImGui::SetCurrentContext(gui->imgui_ctx);
 
   // Start ImGui frame
   ImGuiIO &io = ImGui::GetIO();
@@ -474,7 +678,11 @@ void render(PluginGui *gui) {
 
   ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+#ifdef _WIN32
+  SwapBuffers(gui->hdc);
+#else
   glXSwapBuffers(g_display, gui->window);
+#endif
 }
 
 // ============================================================================

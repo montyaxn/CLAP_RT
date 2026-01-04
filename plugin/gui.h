@@ -5,19 +5,29 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <X11/Xlib.h>
 #include <GL/glx.h>
+#endif
 
 struct ImGuiContext;
 
 namespace gui {
 
 /// GUI state for a single plugin instance.
-/// Manages X11 window, GLX context, and ImGui rendering.
+/// Manages native window, OpenGL context, and ImGui rendering.
 struct PluginGui {
-  // X11/OpenGL resources
+  // Platform-specific window/context
+#ifdef _WIN32
+  HWND hwnd = nullptr;
+  HDC hdc = nullptr;
+  HGLRC hglrc = nullptr;
+#else
   Window window = 0;
   GLXContext glx_context = nullptr;
+#endif
   ImGuiContext *imgui_ctx = nullptr;
 
   // Window state
