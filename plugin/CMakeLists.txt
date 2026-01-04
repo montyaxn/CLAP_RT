@@ -26,5 +26,3 @@ set_target_properties(jit_dsp PROPERTIES
     SUFFIX ".clap"
 )
 
-# Copy dsp.cc to build directory for easy access
-configure_file(dsp.cc ${CMAKE_BINARY_DIR}/plugin/dsp.cc COPYONLY)

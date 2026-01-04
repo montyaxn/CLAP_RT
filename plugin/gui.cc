@@ -37,23 +37,34 @@ static void shutdown_x11() {
   }
 }
 
-/// Scans the directory for .cc files and populates dsp_files list.
+/// Scans subdirectories for .cc files and populates dsp_files list.
+/// Files are stored as "folder/file.cc" format.
 void scan_dsp_files(PluginGui *gui, const char *dir) {
   gui->dsp_files.clear();
   gui->selected_file_index = 0;
 
   std::error_code ec;
-  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-    if (entry.path().extension() == ".cc") {
-      gui->dsp_files.push_back(entry.path().filename().string());
+  std::filesystem::path base_dir(dir);
+
+  // Scan each subdirectory (local/, @username/, etc.)
+  for (const auto &subdir : std::filesystem::directory_iterator(base_dir, ec)) {
+    if (!subdir.is_directory()) continue;
+
+    std::string folder_name = subdir.path().filename().string();
+
+    for (const auto &file : std::filesystem::directory_iterator(subdir.path(), ec)) {
+      if (file.path().extension() == ".cc") {
+        std::string relative_path = folder_name + "/" + file.path().filename().string();
+        gui->dsp_files.push_back(relative_path);
+      }
     }
   }
 
   std::sort(gui->dsp_files.begin(), gui->dsp_files.end());
 
-  // Default to "dsp.cc" if it exists
+  // Default to "local/gain.cc" if it exists
   for (size_t i = 0; i < gui->dsp_files.size(); i++) {
-    if (gui->dsp_files[i] == "dsp.cc") {
+    if (gui->dsp_files[i] == "local/gain.cc") {
       gui->selected_file_index = static_cast<int>(i);
       break;
     }
