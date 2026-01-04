@@ -369,6 +369,14 @@ static void draw_gui_content(PluginGui *gui) {
     }
   }
 
+  ImGui::SameLine();
+
+  if (ImGui::Button("Open Folder", ImVec2(120, 40))) {
+    if (gui->on_open_folder) {
+      gui->on_open_folder();
+    }
+  }
+
   ImGui::Spacing();
 
   if (!gui->last_error.empty()) {
@@ -406,6 +414,32 @@ static void draw_gui_content(PluginGui *gui) {
     }
   } else {
     ImGui::Text("No .cc files found");
+  }
+
+  // Parameters section
+  ImGui::Separator();
+  ImGui::Text("Parameters");
+  ImGui::Spacing();
+
+  int param_count = gui->get_param_count ? gui->get_param_count() : 0;
+  if (param_count == 0) {
+    ImGui::TextDisabled("No parameters defined");
+  }
+
+  for (int i = 0; i < param_count; ++i) {
+    const char *name = gui->get_param_name ? gui->get_param_name(i) : "?";
+    float min_val = gui->get_param_min ? gui->get_param_min(i) : 0.0f;
+    float max_val = gui->get_param_max ? gui->get_param_max(i) : 1.0f;
+    float value = gui->get_param_value ? gui->get_param_value(i) : 0.0f;
+
+    ImGui::PushID(i);
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::SliderFloat(name, &value, min_val, max_val, "%.2f")) {
+      if (gui->on_param_changed) {
+        gui->on_param_changed(i, value);
+      }
+    }
+    ImGui::PopID();
   }
 
   ImGui::End();

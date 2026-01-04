@@ -16,9 +16,28 @@
 /// Directory containing DSP source files (~/.local/share/rt-clap/)
 static std::filesystem::path g_dsp_dir;
 
-/// DSP process function signature
+/// Global parameter array - DSP reads directly for performance
+/// Exported so JIT-compiled DSP code can access via extern
+float g_params[16] = {1.0f};  // [0] = gain, default 1.0
+
+/// DSP function signatures
 using ProcessFn = void (*)(const float *const *, float *const *, uint32_t,
                            uint32_t);
+using InitFn = bool (*)(double, uint32_t, uint32_t);
+using DestroyFn = void (*)();
+
+/// DSP parameter query functions
+using ParamCountFn = int (*)();
+using ParamNameFn = const char *(*)(int);
+using ParamFloatFn = float (*)(int);
+
+/// Parameter info from DSP
+struct ParamInfo {
+  std::string name;
+  float min_value = 0.0f;
+  float max_value = 1.0f;
+  float default_value = 0.5f;
+};
 
 /// Per-instance plugin state
 struct PluginState {
@@ -30,6 +49,25 @@ struct PluginState {
   // Hot-reload support (atomic swap at frame boundary)
   std::atomic<bool> reload_pending{false};
   ProcessFn pending_fn = nullptr;
+  std::unique_ptr<clap_rt::ClapJIT> pending_jit;  // New JIT, swapped at frame boundary
+
+  // DSP lifecycle functions (optional)
+  InitFn dsp_init = nullptr;
+  DestroyFn dsp_destroy = nullptr;
+
+  // Pending lifecycle functions for hot-reload
+  InitFn pending_init = nullptr;
+  DestroyFn pending_destroy = nullptr;
+
+  // Audio parameters (stored for hot-reload init calls)
+  double sample_rate = 0;
+  uint32_t min_frames = 0;
+  uint32_t max_frames = 0;
+  bool dsp_activated = false;
+
+  // Dynamic parameters from DSP
+  std::vector<ParamInfo> param_info;
+  std::vector<float> gui_params;  // GUI writes, process reads (synced each frame)
 
   // File watching for auto-reload
   std::filesystem::file_time_type last_modified{};
@@ -102,16 +140,31 @@ static std::vector<std::string> get_lib_sources() {
   return sources;
 }
 
-/// Recompiles the DSP code from the selected file in ~/.local/share/rt-clap/.
-/// Also compiles any .cc files in lib/ folder.
-/// Updates GUI state with success/error status.
-/// Uses atomic swap to safely update the process function pointer.
-static void do_recompile(PluginState *state) {
-  state->gui_state.last_error.clear();
-  state->gui_state.compile_success = false;
+/// Result of a compilation attempt
+struct CompileResult {
+  std::unique_ptr<clap_rt::ClapJIT> jit;
+  ProcessFn process_fn = nullptr;
+  InitFn init_fn = nullptr;
+  DestroyFn destroy_fn = nullptr;
 
-  auto dsp_path = g_dsp_dir / get_selected_dsp_file(state);
+  // Parameter query functions (optional)
+  ParamCountFn param_count = nullptr;
+  ParamNameFn param_name = nullptr;
+  ParamFloatFn param_min = nullptr;
+  ParamFloatFn param_max = nullptr;
+  ParamFloatFn param_default = nullptr;
+
+  std::string error;
+
+  bool success() const { return process_fn != nullptr; }
+};
+
+/// Compiles DSP code and returns the result.
+/// Handles lib/ sources and the main DSP file.
+static CompileResult compile_dsp(const std::filesystem::path &dsp_path) {
+  CompileResult result;
   auto lib_dir = g_dsp_dir / "lib";
+
   log_compile("Compiling: " + dsp_path.string());
 
   // Set up JIT options with lib/ as include path
@@ -120,52 +173,190 @@ static void do_recompile(PluginState *state) {
     opts.includePaths.push_back(lib_dir.string());
   }
 
-  // Create fresh JIT instance
+  // Set up cache directory
+#ifdef _WIN32
+  if (const char *appdata = std::getenv("LOCALAPPDATA")) {
+    opts.cacheDir = (std::filesystem::path(appdata) / "rt-clap" / "cache").string();
+  }
+#else
+  if (const char *home = std::getenv("HOME")) {
+    opts.cacheDir = (std::filesystem::path(home) / ".cache" / "rt-clap").string();
+  }
+#endif
+
+  // Create JIT instance
   auto jit_or_err = clap_rt::ClapJIT::create(opts);
   if (!jit_or_err) {
-    state->gui_state.last_error = llvm::toString(jit_or_err.takeError());
-    log_compile("JIT create error: " + state->gui_state.last_error);
-    return;
+    result.error = llvm::toString(jit_or_err.takeError());
+    log_compile("JIT create error: " + result.error);
+    return result;
   }
 
-  auto new_jit = std::make_unique<clap_rt::ClapJIT>(std::move(*jit_or_err));
+  result.jit = std::make_unique<clap_rt::ClapJIT>(std::move(*jit_or_err));
+
+  // Define g_params symbol so DSP code can access it
+  if (auto err = result.jit->defineSymbol("g_params", g_params)) {
+    result.error = llvm::toString(std::move(err));
+    log_compile("Symbol define error: " + result.error);
+    result.jit.reset();
+    return result;
+  }
 
   // Compile lib/ sources first
   for (const auto &lib_src : get_lib_sources()) {
     log_compile("Compiling lib: " + lib_src);
-    auto err = new_jit->addModule(lib_src);
+    auto err = result.jit->addModule(lib_src);
     if (err) {
-      state->gui_state.last_error = llvm::toString(std::move(err));
-      log_compile("Lib compile error: " + state->gui_state.last_error);
-      return;
+      result.error = llvm::toString(std::move(err));
+      log_compile("Lib compile error: " + result.error);
+      result.jit.reset();
+      return result;
     }
   }
 
   // Compile DSP code
-  auto err = new_jit->addModule(dsp_path.string());
+  auto err = result.jit->addModule(dsp_path.string());
   if (err) {
-    state->gui_state.last_error = llvm::toString(std::move(err));
-    log_compile("Compile error: " + state->gui_state.last_error);
-    return;
+    result.error = llvm::toString(std::move(err));
+    log_compile("Compile error: " + result.error);
+    result.jit.reset();
+    return result;
   }
 
-  // Lookup process function
-  auto fn_or_err = new_jit->lookupAs<void(const float *const *, float *const *,
-                                          uint32_t, uint32_t)>("process");
+  // Lookup process function (required)
+  auto fn_or_err = result.jit->lookupAs<void(const float *const *, float *const *,
+                                             uint32_t, uint32_t)>("process");
   if (!fn_or_err) {
-    state->gui_state.last_error = llvm::toString(fn_or_err.takeError());
-    log_compile("Lookup error: " + state->gui_state.last_error);
+    result.error = llvm::toString(fn_or_err.takeError());
+    log_compile("Lookup error: " + result.error);
+    result.jit.reset();
+    return result;
+  }
+  result.process_fn = *fn_or_err;
+
+  // Lookup optional init function
+  auto init_or_err = result.jit->lookupAs<bool(double, uint32_t, uint32_t)>("init");
+  if (init_or_err) {
+    result.init_fn = *init_or_err;
+    log_compile("Found init()");
+  } else {
+    llvm::consumeError(init_or_err.takeError());
+  }
+
+  // Lookup optional destroy function
+  auto destroy_or_err = result.jit->lookupAs<void()>("destroy");
+  if (destroy_or_err) {
+    result.destroy_fn = *destroy_or_err;
+    log_compile("Found destroy()");
+  } else {
+    llvm::consumeError(destroy_or_err.takeError());
+  }
+
+  // Lookup optional parameter query functions
+  if (auto fn = result.jit->lookupAs<int()>("param_count")) {
+    result.param_count = *fn;
+    log_compile("Found param_count()");
+  } else {
+    llvm::consumeError(fn.takeError());
+  }
+
+  if (auto fn = result.jit->lookupAs<const char *(int)>("param_name")) {
+    result.param_name = *fn;
+  } else {
+    llvm::consumeError(fn.takeError());
+  }
+
+  if (auto fn = result.jit->lookupAs<float(int)>("param_min")) {
+    result.param_min = *fn;
+  } else {
+    llvm::consumeError(fn.takeError());
+  }
+
+  if (auto fn = result.jit->lookupAs<float(int)>("param_max")) {
+    result.param_max = *fn;
+  } else {
+    llvm::consumeError(fn.takeError());
+  }
+
+  if (auto fn = result.jit->lookupAs<float(int)>("param_default")) {
+    result.param_default = *fn;
+  } else {
+    llvm::consumeError(fn.takeError());
+  }
+
+  log_compile("Compile success!");
+  return result;
+}
+
+/// Queries DSP for parameter definitions and updates plugin state.
+static void query_dsp_params(PluginState *state, const CompileResult &result) {
+  state->param_info.clear();
+  state->gui_params.clear();
+
+  if (!result.param_count) {
+    log_compile("No param_count() - using 0 parameters");
     return;
   }
 
-  // Set pending function for atomic swap
-  state->pending_fn = *fn_or_err;
-  state->reload_pending.store(true, std::memory_order_release);
+  int count = result.param_count();
+  log_compile("DSP defines " + std::to_string(count) + " parameters");
 
-  // Replace JIT instance
-  state->jit = std::move(new_jit);
+  for (int i = 0; i < count && i < 16; ++i) {
+    ParamInfo info;
+    info.name = result.param_name ? result.param_name(i) : "Param";
+    info.min_value = result.param_min ? result.param_min(i) : 0.0f;
+    info.max_value = result.param_max ? result.param_max(i) : 1.0f;
+    info.default_value = result.param_default ? result.param_default(i) : 0.5f;
+
+    state->param_info.push_back(info);
+    state->gui_params.push_back(info.default_value);
+    g_params[i] = info.default_value;
+
+    log_compile("  [" + std::to_string(i) + "] " + info.name +
+                " (" + std::to_string(info.min_value) + " - " +
+                std::to_string(info.max_value) + ", default " +
+                std::to_string(info.default_value) + ")");
+  }
+}
+
+/// Recompiles the DSP code from the selected file.
+/// Updates GUI state with success/error status.
+/// Uses atomic swap to safely update the process function pointer.
+static void do_recompile(PluginState *state) {
+  state->gui_state.last_error.clear();
+  state->gui_state.compile_success = false;
+
+  auto dsp_path = g_dsp_dir / get_selected_dsp_file(state);
+  auto result = compile_dsp(dsp_path);
+
+  if (!result.success()) {
+    state->gui_state.last_error = result.error;
+    return;
+  }
+
+  // Set pending functions and JIT for atomic swap at frame boundary
+  // IMPORTANT: Don't replace state->jit yet - old JIT must stay alive
+  // until plugin_process() calls the old destroy() function
+  state->pending_fn = result.process_fn;
+  state->pending_init = result.init_fn;
+  state->pending_destroy = result.destroy_fn;
+  state->pending_jit = std::move(result.jit);
+
+  // Query params from new DSP (before swap, but params are just metadata)
+  size_t old_count = state->param_info.size();
+  query_dsp_params(state, result);
+
+  // Notify host if param structure changed
+  if (state->param_info.size() != old_count) {
+    auto *params_host = static_cast<const clap_host_params_t *>(
+        state->host->get_extension(state->host, CLAP_EXT_PARAMS));
+    if (params_host && params_host->rescan) {
+      params_host->rescan(state->host, CLAP_PARAM_RESCAN_ALL);
+    }
+  }
+
+  state->reload_pending.store(true, std::memory_order_release);
   state->gui_state.compile_success = true;
-  log_compile("Compile success!");
 
   // Reset file watcher timestamp to avoid double-compile on file switch
   state->last_modified = std::filesystem::file_time_type{};
@@ -187,6 +378,46 @@ static bool plugin_init(const clap_plugin_t *plugin) {
   state->gui_state.on_recompile = [state]() {
     do_recompile(state);
   };
+  state->gui_state.on_open_folder = []() {
+#ifdef _WIN32
+    std::string cmd = "explorer \"" + g_dsp_dir.string() + "\"";
+#else
+    std::string cmd = "xdg-open \"" + g_dsp_dir.string() + "\" &";
+#endif
+    std::system(cmd.c_str());
+  };
+  state->gui_state.on_param_changed = [state](int id, float value) {
+    if (id >= 0 && id < static_cast<int>(state->gui_params.size())) {
+      state->gui_params[id] = value;
+    }
+  };
+  state->gui_state.get_param_value = [state](int id) -> float {
+    if (id >= 0 && id < static_cast<int>(state->gui_params.size())) {
+      return state->gui_params[id];
+    }
+    return 0.0f;
+  };
+  state->gui_state.get_param_count = [state]() -> int {
+    return static_cast<int>(state->param_info.size());
+  };
+  state->gui_state.get_param_name = [state](int id) -> const char * {
+    if (id >= 0 && id < static_cast<int>(state->param_info.size())) {
+      return state->param_info[id].name.c_str();
+    }
+    return "?";
+  };
+  state->gui_state.get_param_min = [state](int id) -> float {
+    if (id >= 0 && id < static_cast<int>(state->param_info.size())) {
+      return state->param_info[id].min_value;
+    }
+    return 0.0f;
+  };
+  state->gui_state.get_param_max = [state](int id) -> float {
+    if (id >= 0 && id < static_cast<int>(state->param_info.size())) {
+      return state->param_info[id].max_value;
+    }
+    return 1.0f;
+  };
 
   // Scan for available DSP files
   gui::scan_dsp_files(&state->gui_state, g_dsp_dir.c_str());
@@ -195,49 +426,23 @@ static bool plugin_init(const clap_plugin_t *plugin) {
   // Initialize LLVM (safe to call multiple times)
   clap_rt::ClapJIT::initializeLLVM();
 
-  // Set up JIT options with lib/ as include path
-  auto lib_dir = g_dsp_dir / "lib";
-  clap_rt::JITOptions opts;
-  if (std::filesystem::exists(lib_dir)) {
-    opts.includePaths.push_back(lib_dir.string());
-  }
-
-  // Create JIT instance
-  auto jit_or_err = clap_rt::ClapJIT::create(opts);
-  if (!jit_or_err) {
-    log_compile("JIT create error: " + llvm::toString(jit_or_err.takeError()));
-    return false;
-  }
-  state->jit = std::make_unique<clap_rt::ClapJIT>(std::move(*jit_or_err));
-
-  // Compile lib/ sources first
-  for (const auto &lib_src : get_lib_sources()) {
-    log_compile("Compiling lib: " + lib_src);
-    auto err = state->jit->addModule(lib_src);
-    if (err) {
-      log_compile("Lib compile error: " + llvm::toString(std::move(err)));
-      return false;
-    }
-  }
-
   // Compile DSP code
   auto dsp_path = g_dsp_dir / get_selected_dsp_file(state);
-  log_compile("Compiling: " + dsp_path.string());
-  auto err = state->jit->addModule(dsp_path.string());
-  if (err) {
-    log_compile("Compile error: " + llvm::toString(std::move(err)));
+  auto result = compile_dsp(dsp_path);
+
+  if (!result.success()) {
+    log_compile("Init failed: " + result.error);
     return false;
   }
 
-  // Lookup process function
-  auto fn_or_err = state->jit->lookupAs<void(const float *const *,
-                                             float *const *, uint32_t,
-                                             uint32_t)>("process");
-  if (!fn_or_err) {
-    log_compile("Lookup error: " + llvm::toString(fn_or_err.takeError()));
-    return false;
-  }
-  state->process_fn.store(*fn_or_err, std::memory_order_release);
+  state->jit = std::move(result.jit);
+  state->process_fn.store(result.process_fn, std::memory_order_release);
+  state->dsp_init = result.init_fn;
+  state->dsp_destroy = result.destroy_fn;
+
+  // Query DSP for parameter definitions
+  query_dsp_params(state, result);
+
   log_compile("Init success!");
 
   // Register timer for file watching (500ms interval)
@@ -252,6 +457,12 @@ static bool plugin_init(const clap_plugin_t *plugin) {
 
 static void plugin_destroy(const clap_plugin_t *plugin) {
   auto *state = get_state(plugin);
+
+  // Call DSP destroy if still activated (shouldn't happen, but be safe)
+  if (state->dsp_activated && state->dsp_destroy) {
+    state->dsp_destroy();
+    state->dsp_activated = false;
+  }
 
   // Destroy GUI
   gui::destroy(plugin);
@@ -270,15 +481,36 @@ static void plugin_destroy(const clap_plugin_t *plugin) {
 
 static bool plugin_activate(const clap_plugin_t *plugin, double sample_rate,
                             uint32_t min_frames, uint32_t max_frames) {
-  (void)plugin;
-  (void)sample_rate;
-  (void)min_frames;
-  (void)max_frames;
+  auto *state = get_state(plugin);
+
+  // Store audio parameters for hot-reload
+  state->sample_rate = sample_rate;
+  state->min_frames = min_frames;
+  state->max_frames = max_frames;
+
+  // Call DSP init if present
+  if (state->dsp_init) {
+    if (!state->dsp_init(sample_rate, min_frames, max_frames)) {
+      log_compile("DSP init() returned false");
+      return false;
+    }
+    log_compile("DSP init() called");
+  }
+
+  state->dsp_activated = true;
   return true;
 }
 
 static void plugin_deactivate(const clap_plugin_t *plugin) {
-  (void)plugin;
+  auto *state = get_state(plugin);
+
+  // Call DSP destroy if present
+  if (state->dsp_activated && state->dsp_destroy) {
+    state->dsp_destroy();
+    log_compile("DSP destroy() called");
+  }
+
+  state->dsp_activated = false;
 }
 
 static bool plugin_start_processing(const clap_plugin_t *plugin) {
@@ -304,8 +536,45 @@ static clap_process_status plugin_process(const clap_plugin_t *plugin,
 
   // Check for hot-reload at frame boundary
   if (state->reload_pending.load(std::memory_order_acquire)) {
+    // Call old destroy before swapping (old JIT still alive here)
+    if (state->dsp_activated && state->dsp_destroy) {
+      state->dsp_destroy();
+    }
+
+    // Swap JIT instance (destroys old JIT - safe because we already called destroy)
+    state->jit = std::move(state->pending_jit);
+
+    // Swap function pointers
     state->process_fn.store(state->pending_fn, std::memory_order_release);
+    state->dsp_init = state->pending_init;
+    state->dsp_destroy = state->pending_destroy;
     state->reload_pending.store(false, std::memory_order_release);
+
+    // Call new init after swap (new JIT now active)
+    if (state->dsp_activated && state->dsp_init) {
+      state->dsp_init(state->sample_rate, state->min_frames, state->max_frames);
+    }
+  }
+
+  // Sync GUI parameters to global array
+  for (size_t i = 0; i < state->gui_params.size(); ++i) {
+    g_params[i] = state->gui_params[i];
+  }
+
+  // Process incoming CLAP parameter events from host
+  if (process->in_events) {
+    for (uint32_t i = 0; i < process->in_events->size(process->in_events); ++i) {
+      auto *event = process->in_events->get(process->in_events, i);
+      if (event->space_id != CLAP_CORE_EVENT_SPACE_ID)
+        continue;
+      if (event->type == CLAP_EVENT_PARAM_VALUE) {
+        auto *pv = reinterpret_cast<const clap_event_param_value_t *>(event);
+        if (pv->param_id < state->gui_params.size()) {
+          g_params[pv->param_id] = static_cast<float>(pv->value);
+          state->gui_params[pv->param_id] = g_params[pv->param_id];
+        }
+      }
+    }
   }
 
   ProcessFn fn = state->process_fn.load(std::memory_order_acquire);
@@ -365,6 +634,86 @@ static const clap_plugin_audio_ports_t audio_ports_extension = {
     .get = audio_ports_get,
 };
 
+// --- Parameters ---
+
+static uint32_t params_count(const clap_plugin_t *plugin) {
+  auto *state = get_state(plugin);
+  return static_cast<uint32_t>(state->param_info.size());
+}
+
+static bool params_get_info(const clap_plugin_t *plugin, uint32_t index,
+                            clap_param_info_t *info) {
+  auto *state = get_state(plugin);
+  if (index >= state->param_info.size())
+    return false;
+
+  const auto &p = state->param_info[index];
+  info->id = index;
+  info->flags = CLAP_PARAM_IS_AUTOMATABLE;
+  strncpy(info->name, p.name.c_str(), CLAP_NAME_SIZE);
+  strncpy(info->module, "", CLAP_PATH_SIZE);
+  info->min_value = p.min_value;
+  info->max_value = p.max_value;
+  info->default_value = p.default_value;
+  return true;
+}
+
+static bool params_get_value(const clap_plugin_t *plugin, clap_id param_id,
+                             double *value) {
+  auto *state = get_state(plugin);
+  if (param_id >= state->param_info.size())
+    return false;
+  *value = g_params[param_id];
+  return true;
+}
+
+static bool params_value_to_text(const clap_plugin_t *plugin, clap_id param_id,
+                                 double value, char *buf, uint32_t size) {
+  auto *state = get_state(plugin);
+  if (param_id >= state->param_info.size())
+    return false;
+  snprintf(buf, size, "%.2f", value);
+  return true;
+}
+
+static bool params_text_to_value(const clap_plugin_t *plugin, clap_id param_id,
+                                 const char *text, double *value) {
+  (void)plugin;
+  (void)param_id;
+  (void)text;
+  (void)value;
+  return false;  // Not implemented
+}
+
+static void params_flush(const clap_plugin_t *plugin,
+                         const clap_input_events_t *in,
+                         const clap_output_events_t *out) {
+  (void)out;
+  auto *state = get_state(plugin);
+
+  for (uint32_t i = 0; i < in->size(in); ++i) {
+    auto *event = in->get(in, i);
+    if (event->space_id != CLAP_CORE_EVENT_SPACE_ID)
+      continue;
+    if (event->type == CLAP_EVENT_PARAM_VALUE) {
+      auto *pv = reinterpret_cast<const clap_event_param_value_t *>(event);
+      if (pv->param_id < state->param_info.size()) {
+        g_params[pv->param_id] = static_cast<float>(pv->value);
+        state->gui_params[pv->param_id] = g_params[pv->param_id];
+      }
+    }
+  }
+}
+
+static const clap_plugin_params_t params_extension = {
+    .count = params_count,
+    .get_info = params_get_info,
+    .get_value = params_get_value,
+    .value_to_text = params_value_to_text,
+    .text_to_value = params_text_to_value,
+    .flush = params_flush,
+};
+
 // --- Timer Support ---
 
 /// Timer callback handling both file watching and GUI rendering.
@@ -416,6 +765,8 @@ static const void *plugin_get_extension(const clap_plugin_t *plugin,
   (void)plugin;
   if (strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0)
     return &audio_ports_extension;
+  if (strcmp(id, CLAP_EXT_PARAMS) == 0)
+    return &params_extension;
   if (strcmp(id, CLAP_EXT_GUI) == 0)
     return gui::get_extension();
   if (strcmp(id, CLAP_EXT_TIMER_SUPPORT) == 0)
@@ -485,11 +836,20 @@ static const clap_plugin_factory_t plugin_factory = {
 /// Entry point initialization - sets up DSP source directory.
 static bool entry_init(const char *path) {
   (void)path;
+
+#ifdef _WIN32
+  // Windows: Use %APPDATA%\rt-clap
+  const char *appdata = getenv("APPDATA");
+  if (!appdata)
+    return false;
+  g_dsp_dir = std::filesystem::path(appdata) / "rt-clap";
+#else
+  // Linux/macOS: Use ~/.local/share/rt-clap
   const char *home = getenv("HOME");
   if (!home)
     return false;
-
   g_dsp_dir = std::filesystem::path(home) / ".local" / "share" / "rt-clap";
+#endif
 
   // Create directory if it doesn't exist
   std::error_code ec;

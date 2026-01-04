@@ -25,8 +25,10 @@ struct PluginGui {
   uint32_t width = 400;
   uint32_t height = 300;
 
-  // Recompile callback - set by plugin
+  // Callbacks - set by plugin
   std::function<void()> on_recompile;
+  std::function<void()> on_open_folder;
+  std::function<void(int, float)> on_param_changed;  // (param_id, value)
 
   // Status display
   std::string last_error;
@@ -35,6 +37,13 @@ struct PluginGui {
   // DSP file selection
   std::vector<std::string> dsp_files;  // Available .cc files
   int selected_file_index = 0;          // Currently selected index
+
+  // Dynamic parameter callbacks
+  std::function<int()> get_param_count;
+  std::function<const char *(int)> get_param_name;
+  std::function<float(int)> get_param_min;
+  std::function<float(int)> get_param_max;
+  std::function<float(int)> get_param_value;
 
   // Host references for timer support
   const clap_host_t *host = nullptr;

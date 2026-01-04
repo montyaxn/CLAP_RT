@@ -1,14 +1,25 @@
 cmake_minimum_required(VERSION 3.20.0)
 
-project(CLAP_RT)
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# LLVM is built without RTTI, so we must match
-add_compile_options(-fno-rtti)
+project(CLAP_RT)
 
-add_link_options("-fuse-ld=mold")
+# LLVM is built without RTTI, so we must match
+if(MSVC)
+  add_compile_options(/GR-)
+  # Suppress some common MSVC warnings
+  add_compile_options(/wd4624 /wd4291)
+else()
+  add_compile_options(-fno-rtti)
+  # Use mold linker on Linux if available
+  if(UNIX AND NOT APPLE)
+    add_link_options("-fuse-ld=mold")
+  endif()
+endif()
+
+# LTO disabled - LLVM static libs weren't built with LTO, so minimal benefit
+# set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 
 # ---- llvm setup ----
