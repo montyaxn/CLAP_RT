@@ -40,3 +40,22 @@ set_target_properties(jit_dsp PROPERTIES
     SUFFIX ".clap"
 )
 
+# Copy examples to DSP directory after build
+if(WIN32)
+  set(DSP_DIR "$ENV{APPDATA}/rt-clap")
+else()
+  set(DSP_DIR "$ENV{HOME}/.local/share/rt-clap")
+endif()
+
+add_custom_command(TARGET jit_dsp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DSP_DIR}/local"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DSP_DIR}/lib"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/examples/local"
+        "${DSP_DIR}/local"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/examples/lib"
+        "${DSP_DIR}/lib"
+    COMMENT "Copying example DSP files to ${DSP_DIR}"
+)
+
