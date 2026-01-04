@@ -5,6 +5,9 @@ project(CLAP_RT)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# LLVM is built without RTTI, so we must match
+add_compile_options(-fno-rtti)
+
 add_link_options("-fuse-ld=mold")
 
 
@@ -42,9 +45,58 @@ include_directories(${CLANG_INCLUDE_DIRS})
 find_package(GTest REQUIRED)
 # ---- GTest setup end ----
 
+# ---- CLAP setup ----
+include(FetchContent)
+FetchContent_Declare(
+    clap
+    GIT_REPOSITORY https://github.com/free-audio/clap.git
+    GIT_TAG main
+)
+FetchContent_MakeAvailable(clap)
+# ---- CLAP setup end ----
+
+# ---- GLFW setup ----
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.4
+)
+FetchContent_MakeAvailable(glfw)
+# ---- GLFW setup end ----
+
+# ---- Dear ImGui setup ----
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.6
+)
+FetchContent_MakeAvailable(imgui)
+
+# Create ImGui library
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui PUBLIC glfw)
+set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# ---- Dear ImGui setup end ----
+
 add_library(CLAP_RT_core
     src/JIT.cc
 )
+
+set_target_properties(CLAP_RT_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(CLAP_RT_core
     PUBLIC
@@ -85,4 +137,6 @@ target_link_libraries(CLAP_RT_core_test
 include(GoogleTest)
 gtest_discover_tests(CLAP_RT_core_test)
 
+# ---- Plugin ----
+add_subdirectory(plugin)
 

@@ -1,40 +1,83 @@
 #include "JIT.h"
+#include "Error.h"
+
+#include <clang/Basic/DiagnosticOptions.h>
 #include <clang/CodeGen/CodeGenAction.h>
 #include <clang/Frontend/CompilerInstance.h>
-#include <llvm/ADT/StringRef.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/Support/Error.h>
+#include <llvm/Support/TargetSelect.h>
 #include <llvm/TargetParser/Host.h>
 
-llvm::Expected<ClapJIT> ClapJIT::create() {
-  auto JIT = ClapJIT();
+namespace clap_rt {
+
+namespace {
+namespace orc = llvm::orc;
+} // anonymous namespace
+
+void ClapJIT::initializeLLVM() {
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmParser();
+  llvm::InitializeNativeTargetAsmPrinter();
+}
+
+llvm::Expected<ClapJIT> ClapJIT::create(JITOptions opts) {
+  ClapJIT jit;
+  jit.options_ = std::move(opts);
+
   auto JITOrErr = orc::LLJITBuilder().create();
   if (!JITOrErr)
     return JITOrErr.takeError();
-  JIT.llJIT = std::move(*JITOrErr);
-  return JIT;
+
+  jit.llJIT_ = std::move(*JITOrErr);
+  return jit;
 }
 
 llvm::Expected<std::unique_ptr<llvm::Module>>
-ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext *Ctx) {
+ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext &Ctx) {
   clang::CompilerInstance CI;
-  CI.createDiagnostics();
 
+  // Set up diagnostics - just use default behavior
+  CI.createDiagnostics();
+  if (!CI.hasDiagnostics()) {
+    return makeError(ErrorCode::CompilationFailed,
+                     "Failed to create diagnostics", FilePath);
+  }
+
+  // Configure target
   auto &TO = CI.getInvocation().getTargetOpts();
-  TO.Triple = llvm::sys::getProcessTriple();
-  if (TO.Triple.empty())
-    TO.Triple = llvm::sys::getDefaultTargetTriple();
+  if (options_.targetTriple.empty()) {
+    TO.Triple = llvm::sys::getProcessTriple();
+    if (TO.Triple.empty())
+      TO.Triple = llvm::sys::getDefaultTargetTriple();
+  } else {
+    TO.Triple = options_.targetTriple;
+  }
 
   clang::TargetInfo *TI = clang::TargetInfo::CreateTargetInfo(
       CI.getDiagnostics(), CI.getInvocation().getTargetOpts());
-  if (!TI)
-    return llvm::make_error<llvm::StringError>("TargetInfo failed",
-                                               llvm::inconvertibleErrorCode());
+  if (!TI) {
+    return makeError(ErrorCode::TargetCreationFailed,
+                     "Failed to create TargetInfo for triple: " + TO.Triple,
+                     FilePath);
+  }
   CI.setTarget(TI);
 
-  CI.getLangOpts().CPlusPlus = 1;
-  CI.getLangOpts().CPlusPlus17 = 1;
+  // Configure language options
+  auto &LO = CI.getLangOpts();
+  LO.CPlusPlus = 1;
+  switch (options_.langStandard) {
+  case LangStandard::CXX14:
+    LO.CPlusPlus14 = 1;
+    break;
+  case LangStandard::CXX17:
+    LO.CPlusPlus17 = 1;
+    break;
+  case LangStandard::CXX20:
+    LO.CPlusPlus20 = 1;
+    break;
+  }
 
   CI.createFileManager();
   CI.createSourceManager();
@@ -44,17 +87,18 @@ ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext *Ctx) {
   FrontendOpts.Inputs.push_back(
       clang::FrontendInputFile(FilePath, clang::Language::CXX));
 
-  auto Act = std::make_unique<clang::EmitLLVMOnlyAction>(Ctx);
+  auto Act = std::make_unique<clang::EmitLLVMOnlyAction>(&Ctx);
 
   if (!CI.ExecuteAction(*Act)) {
-    return llvm::make_error<llvm::StringError>(
-        "Failed to compile file: " + FilePath, llvm::inconvertibleErrorCode());
+    return makeError(ErrorCode::CompilationFailed,
+                     "Compilation failed (check stderr for diagnostics)",
+                     FilePath);
   }
 
   std::unique_ptr<llvm::Module> M = Act->takeModule();
   if (!M) {
-    return llvm::make_error<llvm::StringError>("No module generated",
-                                               llvm::inconvertibleErrorCode());
+    return makeError(ErrorCode::ModuleGenerationFailed,
+                     "No module generated after compilation", FilePath);
   }
 
   return M;
@@ -62,31 +106,52 @@ ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext *Ctx) {
 
 llvm::Error ClapJIT::addModule(llvm::StringRef FilePath) {
   auto Ctx = std::make_unique<llvm::LLVMContext>();
-  auto IROrErr = compileSingleFile(FilePath, Ctx.get());
+  auto IROrErr = compileSingleFile(FilePath, *Ctx);
   if (!IROrErr)
     return IROrErr.takeError();
-  auto TSM = orc::ThreadSafeModule(std::move(IROrErr.get()), std::move(Ctx));
 
-  if (auto Err = llJIT->addIRModule(std::move(TSM)))
+  // Collect symbols before moving the module
+  for (const auto &F : **IROrErr) {
+    if (!F.isDeclaration()) {
+      std::string mangled = F.getName().str();
+      std::string demangled = llvm::demangle(mangled);
+      symbols_.emplace_back(demangled, mangled);
+    }
+  }
+
+  auto TSM = orc::ThreadSafeModule(std::move(*IROrErr), std::move(Ctx));
+
+  if (auto Err = llJIT_->addIRModule(std::move(TSM)))
     return Err;
+
   return llvm::Error::success();
 }
 
-llvm::Error ClapJIT::addModule(std::vector<llvm::StringRef> FilePaths) {
-  for (auto FilePath : FilePaths) {
-    auto Ctx = std::make_unique<llvm::LLVMContext>();
-    auto IROrErr = compileSingleFile(FilePath, Ctx.get());
-    if (!IROrErr)
-      return IROrErr.takeError();
-    auto TSM = orc::ThreadSafeModule(std::move(IROrErr.get()), std::move(Ctx));
-
-    if (auto Err = llJIT->addIRModule(std::move(TSM)))
+llvm::Error ClapJIT::addModules(llvm::ArrayRef<llvm::StringRef> FilePaths) {
+  for (const auto &FilePath : FilePaths) {
+    if (auto Err = addModule(FilePath))
       return Err;
   }
   return llvm::Error::success();
 }
 
-llvm::Expected<orc::ExecutorAddr>
-ClapJIT::lookup(llvm::StringRef UnmangledName) {
-  return llJIT->lookup(UnmangledName);
+std::optional<std::string>
+ClapJIT::findSymbol(llvm::StringRef FunctionName) const {
+  for (const auto &[demangled, mangled] : symbols_) {
+    // Check if demangled name starts with the function name
+    // e.g., "add_cxx(int, int)" starts with "add_cxx"
+    if (demangled.starts_with(FunctionName.str()) &&
+        (demangled.size() == FunctionName.size() ||
+         demangled[FunctionName.size()] == '(')) {
+      return mangled;
+    }
+  }
+  return std::nullopt;
 }
+
+llvm::Expected<orc::ExecutorAddr>
+ClapJIT::lookup(llvm::StringRef UnmangledName) const {
+  return llJIT_->lookup(UnmangledName);
+}
+
+} // namespace clap_rt
