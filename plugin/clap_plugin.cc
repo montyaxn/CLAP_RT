@@ -121,7 +121,7 @@ static std::string get_selected_dsp_file(PluginState *state) {
 /// Logs compilation errors to ~/.local/share/rt-clap/compile.log
 static void log_compile(const std::string &msg) {
   auto log_path = g_dsp_dir / "compile.log";
-  if (auto f = fopen(log_path.c_str(), "a")) {
+  if (auto f = fopen(log_path.string().c_str(), "a")) {
     fprintf(f, "%s\n", msg.c_str());
     fclose(f);
   }
@@ -420,7 +420,7 @@ static bool plugin_init(const clap_plugin_t *plugin) {
   };
 
   // Scan for available DSP files
-  gui::scan_dsp_files(&state->gui_state, g_dsp_dir.c_str());
+  gui::scan_dsp_files(&state->gui_state, g_dsp_dir.string().c_str());
   log_compile("Found " + std::to_string(state->gui_state.dsp_files.size()) + " DSP files");
 
   // Initialize LLVM (safe to call multiple times)
@@ -734,7 +734,7 @@ static void timer_on_timer(const clap_plugin_t *plugin, clap_id timer_id) {
     auto folder_time = std::filesystem::last_write_time(g_dsp_dir, ec);
     if (!ec && state->folder_modified != std::filesystem::file_time_type{} &&
         folder_time != state->folder_modified) {
-      gui::scan_dsp_files(&state->gui_state, g_dsp_dir.c_str());
+      gui::scan_dsp_files(&state->gui_state, g_dsp_dir.string().c_str());
       log_compile("Folder changed, rescanned. Found " +
                   std::to_string(state->gui_state.dsp_files.size()) + " files");
     }

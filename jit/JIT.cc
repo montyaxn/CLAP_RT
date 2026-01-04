@@ -24,10 +24,12 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <new>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -203,16 +205,74 @@ llvm::Expected<ClapJIT> ClapJIT::create(JITOptions opts) {
   // Load MSVC C++ runtime for STL support
   // Try different versions of the runtime
   const char *msvcRuntimes[] = {
-      "msvcp140.dll",      // VS 2015-2022
-      "msvcp140_1.dll",    // Additional runtime
-      "msvcp140_2.dll",    // Additional runtime
-      "vcruntime140.dll",  // VC runtime
-      "ucrtbase.dll",      // Universal CRT
+      "vcruntime140.dll",    // VC runtime (load first - has type_info)
+      "vcruntime140_1.dll",  // Additional VC runtime
+      "msvcp140.dll",        // VS 2015-2022 C++ runtime
+      "msvcp140_1.dll",      // Additional runtime
+      "msvcp140_2.dll",      // Additional runtime
+      "ucrtbase.dll",        // Universal CRT
   };
   for (const char *runtime : msvcRuntimes) {
+    // Ensure runtime is loaded, then add symbol generator
+    if (!GetModuleHandleA(runtime)) {
+      LoadLibraryA(runtime);
+    }
     auto Gen = orc::EPCDynamicLibrarySearchGenerator::Load(ES, runtime);
     if (Gen)
       MainJD.addGenerator(std::move(*Gen));
+  }
+
+  // Define common MSVC runtime symbols that might not be exported
+  // operator delete(void*, size_t) - ??3@YAXPEAX_K@Z
+  auto DeleteSized = [](void *ptr, size_t) { ::operator delete(ptr); };
+  auto DeleteSizedSym = orc::ExecutorSymbolDef(
+      orc::ExecutorAddr::fromPtr(+DeleteSized),
+      llvm::JITSymbolFlags::Exported);
+  if (auto Err = MainJD.define(orc::absoluteSymbols(
+          {{ES.intern("??3@YAXPEAX_K@Z"), DeleteSizedSym}}))) {
+    llvm::consumeError(std::move(Err)); // Ignore if already defined
+  }
+
+  // operator delete[](void*, size_t) - ??_V@YAXPEAX_K@Z
+  auto DeleteArraySized = [](void *ptr, size_t) { ::operator delete[](ptr); };
+  auto DeleteArraySizedSym = orc::ExecutorSymbolDef(
+      orc::ExecutorAddr::fromPtr(+DeleteArraySized),
+      llvm::JITSymbolFlags::Exported);
+  if (auto Err = MainJD.define(orc::absoluteSymbols(
+          {{ES.intern("??_V@YAXPEAX_K@Z"), DeleteArraySizedSym}}))) {
+    llvm::consumeError(std::move(Err));
+  }
+
+  // type_info vtable - ??_7type_info@@6B@
+  // Get from vcruntime DLL
+  if (HMODULE hVcRuntime = GetModuleHandleA("vcruntime140.dll")) {
+    if (FARPROC vtable = GetProcAddress(hVcRuntime, "??_7type_info@@6B@")) {
+      auto TypeInfoVtableSym = orc::ExecutorSymbolDef(
+          orc::ExecutorAddr::fromPtr(reinterpret_cast<void *>(vtable)),
+          llvm::JITSymbolFlags::Exported);
+      if (auto Err = MainJD.define(orc::absoluteSymbols(
+              {{ES.intern("??_7type_info@@6B@"), TypeInfoVtableSym}}))) {
+        llvm::consumeError(std::move(Err));
+      }
+    }
+  }
+
+  // Stub functions for STL error paths (should never be called in normal operation)
+  auto AbortStub = []() { std::abort(); };
+  auto AbortStubSym = orc::ExecutorSymbolDef(
+      orc::ExecutorAddr::fromPtr(+AbortStub),
+      llvm::JITSymbolFlags::Exported);
+
+  // std::_Throw_bad_array_new_length
+  if (auto Err = MainJD.define(orc::absoluteSymbols(
+          {{ES.intern("?_Throw_bad_array_new_length@std@@YAXXZ"), AbortStubSym}}))) {
+    llvm::consumeError(std::move(Err));
+  }
+
+  // std::_Xlength_error (vector length error)
+  if (auto Err = MainJD.define(orc::absoluteSymbols(
+          {{ES.intern("?_Xlength_error@std@@YAXPEBD@Z"), AbortStubSym}}))) {
+    llvm::consumeError(std::move(Err));
   }
 #else
   // Load libstdc++ for STL support (commonly available on Linux)
@@ -259,6 +319,12 @@ ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext &Ctx) {
   argStorage.push_back("-fms-compatibility");
   argStorage.push_back("-fms-extensions");
   argStorage.push_back("-fdelayed-template-parsing");
+
+  // Disable exceptions and debugging to simplify STL symbol requirements
+  argStorage.push_back("-fno-exceptions");
+  argStorage.push_back("-D_HAS_EXCEPTIONS=0");
+  argStorage.push_back("-D_ITERATOR_DEBUG_LEVEL=0");
+  argStorage.push_back("-D_CONTAINER_DEBUG_LEVEL=0");
 
   // Add MSVC and Windows SDK include paths
   for (const auto &path : detectMsvcIncludes()) {
@@ -459,12 +525,23 @@ llvm::Error ClapJIT::defineSymbol(llvm::StringRef Name, void *Addr) {
 
 std::optional<std::string>
 ClapJIT::findSymbol(llvm::StringRef FunctionName) const {
+  std::string funcName = FunctionName.str();
+  std::string funcWithParen = funcName + "(";
+
   for (const auto &[demangled, mangled] : symbols_) {
-    // Check if demangled name starts with the function name
-    // e.g., "add_cxx(int, int)" starts with "add_cxx"
-    if (demangled.starts_with(FunctionName.str()) &&
-        (demangled.size() == FunctionName.size() ||
-         demangled[FunctionName.size()] == '(')) {
+    // Check if demangled name contains the function name followed by '('
+    // Itanium ABI: "add_cxx(int, int)"
+    // MSVC ABI: "int __cdecl add_cxx(int,int)"
+    auto pos = demangled.find(funcWithParen);
+    if (pos != std::string::npos) {
+      // Make sure it's not a substring of another identifier
+      // (check that char before is not alphanumeric or underscore)
+      if (pos == 0 || (!std::isalnum(demangled[pos - 1]) && demangled[pos - 1] != '_')) {
+        return mangled;
+      }
+    }
+    // Also check for exact match (no parameters in demangled name)
+    if (demangled == funcName) {
       return mangled;
     }
   }

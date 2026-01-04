@@ -52,12 +52,20 @@ message(STATUS "Found Clang ${CLANG_PACKAGE_VERSION}")
 include_directories(${CLANG_INCLUDE_DIRS})
 # ---- clang setup end ----
 
+# ---- FetchContent setup ----
+include(FetchContent)
+
 # ---- GTest setup ----
-find_package(GTest REQUIRED)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.15.2
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
 # ---- GTest setup end ----
 
 # ---- CLAP setup ----
-include(FetchContent)
 FetchContent_Declare(
     clap
     GIT_REPOSITORY https://github.com/free-audio/clap.git
