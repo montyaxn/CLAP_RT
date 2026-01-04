@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <llvm/Support/Error.h>
 
-#include "../src/JIT.h"
+#include "../jit/JIT.h"
 
 class ClapJITTest : public ::testing::Test {
 protected:

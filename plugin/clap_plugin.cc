@@ -1,6 +1,6 @@
 #include <clap/clap.h>
 
-#include "../src/JIT.h"
+#include "../jit/JIT.h"
 #include "gui.h"
 
 #include <atomic>

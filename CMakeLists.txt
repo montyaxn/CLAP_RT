@@ -93,7 +93,7 @@ set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # ---- Dear ImGui setup end ----
 
 add_library(CLAP_RT_core
-    src/JIT.cc
+    jit/JIT.cc
 )
 
 set_target_properties(CLAP_RT_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
