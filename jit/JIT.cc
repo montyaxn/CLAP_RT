@@ -29,111 +29,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <new>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 namespace clap_rt {
 
 namespace {
 namespace orc = llvm::orc;
-
-#ifdef _WIN32
-
-// Get environment variable (Windows)
-std::string getEnvVar(const char *name) {
-  char buffer[4096];
-  DWORD len = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
-  if (len > 0 && len < sizeof(buffer))
-    return std::string(buffer, len);
-  return "";
-}
-
-// Auto-detect MSVC STL include path
-std::vector<std::string> detectMsvcIncludes() {
-  std::vector<std::string> paths;
-
-  // Try to find Visual Studio installation
-  // Common paths for VS 2019/2022
-  std::vector<std::string> vsBasePaths = {
-      "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC",
-      "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC",
-      "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC",
-      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community\\VC\\Tools\\MSVC",
-      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Professional\\VC\\Tools\\MSVC",
-      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC\\Tools\\MSVC",
-  };
-
-  for (const auto &basePath : vsBasePaths) {
-    if (!std::filesystem::exists(basePath))
-      continue;
-
-    // Find latest MSVC version
-    std::string latestVersion;
-    for (const auto &entry : std::filesystem::directory_iterator(basePath)) {
-      if (entry.is_directory()) {
-        std::string name = entry.path().filename().string();
-        if (latestVersion.empty() || name > latestVersion)
-          latestVersion = name;
-      }
-    }
-
-    if (!latestVersion.empty()) {
-      auto msvcPath = std::filesystem::path(basePath) / latestVersion;
-      paths.push_back((msvcPath / "include").string());
-
-      // Add lib path for x64
-      paths.push_back((msvcPath / "lib" / "x64").string());
-      break;
-    }
-  }
-
-  // Windows SDK
-  std::string sdkVersion = getEnvVar("WindowsSDKVersion");
-  if (sdkVersion.empty())
-    sdkVersion = "10.0.22621.0"; // Fallback to common version
-
-  // Remove trailing backslash if present
-  if (!sdkVersion.empty() && sdkVersion.back() == '\\')
-    sdkVersion.pop_back();
-
-  std::vector<std::string> sdkBasePaths = {
-      "C:\\Program Files (x86)\\Windows Kits\\10\\Include",
-  };
-
-  for (const auto &sdkBase : sdkBasePaths) {
-    auto sdkPath = std::filesystem::path(sdkBase) / sdkVersion;
-    if (std::filesystem::exists(sdkPath)) {
-      paths.push_back((sdkPath / "ucrt").string());
-      paths.push_back((sdkPath / "shared").string());
-      paths.push_back((sdkPath / "um").string());
-      break;
-    }
-  }
-
-  return paths;
-}
-
-// Auto-detect clang builtin include path (Windows)
-std::string detectClangIncludePath() {
-  std::string version = std::to_string(CLANG_VERSION_MAJOR);
-
-  std::vector<std::string> candidates = {
-      "C:\\Program Files\\LLVM\\lib\\clang\\" + version + "\\include",
-      "C:\\Program Files (x86)\\LLVM\\lib\\clang\\" + version + "\\include",
-  };
-
-  for (const auto &path : candidates) {
-    if (std::filesystem::exists(path))
-      return path;
-  }
-
-  return "";
-}
-
-#else // Linux/Unix
 
 // Auto-detect libstdc++ include path
 std::string detectLibstdcxxPath() {
@@ -161,7 +61,7 @@ std::string detectLibstdcxxPath() {
   return "";
 }
 
-// Auto-detect clang builtin include path (Linux)
+// Auto-detect clang builtin include path
 std::string detectClangIncludePath() {
   std::string version = std::to_string(CLANG_VERSION_MAJOR);
 
@@ -176,8 +76,6 @@ std::string detectClangIncludePath() {
   }
   return "/usr/lib/clang/" + version + "/include"; // Fallback
 }
-
-#endif // _WIN32
 
 } // anonymous namespace
 
@@ -201,88 +99,13 @@ llvm::Expected<ClapJIT> ClapJIT::create(JITOptions opts) {
   auto &ES = jit.llJIT_->getExecutionSession();
   auto &MainJD = jit.llJIT_->getMainJITDylib();
 
-#ifdef _WIN32
-  // Load MSVC C++ runtime for STL support
-  // Try different versions of the runtime
-  const char *msvcRuntimes[] = {
-      "vcruntime140.dll",    // VC runtime (load first - has type_info)
-      "vcruntime140_1.dll",  // Additional VC runtime
-      "msvcp140.dll",        // VS 2015-2022 C++ runtime
-      "msvcp140_1.dll",      // Additional runtime
-      "msvcp140_2.dll",      // Additional runtime
-      "ucrtbase.dll",        // Universal CRT
-  };
-  for (const char *runtime : msvcRuntimes) {
-    // Ensure runtime is loaded, then add symbol generator
-    if (!GetModuleHandleA(runtime)) {
-      LoadLibraryA(runtime);
-    }
-    auto Gen = orc::EPCDynamicLibrarySearchGenerator::Load(ES, runtime);
-    if (Gen)
-      MainJD.addGenerator(std::move(*Gen));
-  }
-
-  // Define common MSVC runtime symbols that might not be exported
-  // operator delete(void*, size_t) - ??3@YAXPEAX_K@Z
-  auto DeleteSized = [](void *ptr, size_t) { ::operator delete(ptr); };
-  auto DeleteSizedSym = orc::ExecutorSymbolDef(
-      orc::ExecutorAddr::fromPtr(+DeleteSized),
-      llvm::JITSymbolFlags::Exported);
-  if (auto Err = MainJD.define(orc::absoluteSymbols(
-          {{ES.intern("??3@YAXPEAX_K@Z"), DeleteSizedSym}}))) {
-    llvm::consumeError(std::move(Err)); // Ignore if already defined
-  }
-
-  // operator delete[](void*, size_t) - ??_V@YAXPEAX_K@Z
-  auto DeleteArraySized = [](void *ptr, size_t) { ::operator delete[](ptr); };
-  auto DeleteArraySizedSym = orc::ExecutorSymbolDef(
-      orc::ExecutorAddr::fromPtr(+DeleteArraySized),
-      llvm::JITSymbolFlags::Exported);
-  if (auto Err = MainJD.define(orc::absoluteSymbols(
-          {{ES.intern("??_V@YAXPEAX_K@Z"), DeleteArraySizedSym}}))) {
-    llvm::consumeError(std::move(Err));
-  }
-
-  // type_info vtable - ??_7type_info@@6B@
-  // Get from vcruntime DLL
-  if (HMODULE hVcRuntime = GetModuleHandleA("vcruntime140.dll")) {
-    if (FARPROC vtable = GetProcAddress(hVcRuntime, "??_7type_info@@6B@")) {
-      auto TypeInfoVtableSym = orc::ExecutorSymbolDef(
-          orc::ExecutorAddr::fromPtr(reinterpret_cast<void *>(vtable)),
-          llvm::JITSymbolFlags::Exported);
-      if (auto Err = MainJD.define(orc::absoluteSymbols(
-              {{ES.intern("??_7type_info@@6B@"), TypeInfoVtableSym}}))) {
-        llvm::consumeError(std::move(Err));
-      }
-    }
-  }
-
-  // Stub functions for STL error paths (should never be called in normal operation)
-  auto AbortStub = []() { std::abort(); };
-  auto AbortStubSym = orc::ExecutorSymbolDef(
-      orc::ExecutorAddr::fromPtr(+AbortStub),
-      llvm::JITSymbolFlags::Exported);
-
-  // std::_Throw_bad_array_new_length
-  if (auto Err = MainJD.define(orc::absoluteSymbols(
-          {{ES.intern("?_Throw_bad_array_new_length@std@@YAXXZ"), AbortStubSym}}))) {
-    llvm::consumeError(std::move(Err));
-  }
-
-  // std::_Xlength_error (vector length error)
-  if (auto Err = MainJD.define(orc::absoluteSymbols(
-          {{ES.intern("?_Xlength_error@std@@YAXPEBD@Z"), AbortStubSym}}))) {
-    llvm::consumeError(std::move(Err));
-  }
-#else
-  // Load libstdc++ for STL support (commonly available on Linux)
+  // Load libstdc++ for STL support
   auto LibStdCxxGen = orc::EPCDynamicLibrarySearchGenerator::Load(ES, "libstdc++.so.6");
   if (!LibStdCxxGen) {
     LibStdCxxGen = orc::EPCDynamicLibrarySearchGenerator::Load(ES, "libstdc++.so");
   }
   if (LibStdCxxGen)
     MainJD.addGenerator(std::move(*LibStdCxxGen));
-#endif
 
   // Also search in the host process
   auto DLSG = orc::EPCDynamicLibrarySearchGenerator::GetForTargetProcess(ES);
@@ -314,29 +137,6 @@ ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext &Ctx) {
     break;
   }
 
-#ifdef _WIN32
-  // Windows: Use MSVC STL and Windows SDK headers
-  argStorage.push_back("-fms-compatibility");
-  argStorage.push_back("-fms-extensions");
-  argStorage.push_back("-fdelayed-template-parsing");
-
-  // Disable exceptions and debugging to simplify STL symbol requirements
-  argStorage.push_back("-fno-exceptions");
-  argStorage.push_back("-D_HAS_EXCEPTIONS=0");
-  argStorage.push_back("-D_ITERATOR_DEBUG_LEVEL=0");
-  argStorage.push_back("-D_CONTAINER_DEBUG_LEVEL=0");
-
-  // Add MSVC and Windows SDK include paths
-  for (const auto &path : detectMsvcIncludes()) {
-    argStorage.push_back("-I" + path);
-  }
-
-  // Clang builtins
-  std::string clangPath = detectClangIncludePath();
-  if (!clangPath.empty()) {
-    argStorage.push_back("-I" + clangPath);
-  }
-#else
   // Linux: Use libstdc++ (system default)
   std::string libstdcxxPath = detectLibstdcxxPath();
   if (!libstdcxxPath.empty()) {
@@ -358,7 +158,6 @@ ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext &Ctx) {
   // System headers
   argStorage.push_back("-I/usr/include/x86_64-linux-gnu");
   argStorage.push_back("-I/usr/include");
-#endif
 
   // Add user include paths
   for (const auto &path : options_.includePaths) {
@@ -525,23 +324,12 @@ llvm::Error ClapJIT::defineSymbol(llvm::StringRef Name, void *Addr) {
 
 std::optional<std::string>
 ClapJIT::findSymbol(llvm::StringRef FunctionName) const {
-  std::string funcName = FunctionName.str();
-  std::string funcWithParen = funcName + "(";
-
   for (const auto &[demangled, mangled] : symbols_) {
-    // Check if demangled name contains the function name followed by '('
-    // Itanium ABI: "add_cxx(int, int)"
-    // MSVC ABI: "int __cdecl add_cxx(int,int)"
-    auto pos = demangled.find(funcWithParen);
-    if (pos != std::string::npos) {
-      // Make sure it's not a substring of another identifier
-      // (check that char before is not alphanumeric or underscore)
-      if (pos == 0 || (!std::isalnum(demangled[pos - 1]) && demangled[pos - 1] != '_')) {
-        return mangled;
-      }
-    }
-    // Also check for exact match (no parameters in demangled name)
-    if (demangled == funcName) {
+    // Check if demangled name starts with the function name
+    // e.g., "add_cxx(int, int)" starts with "add_cxx"
+    if (demangled.starts_with(FunctionName.str()) &&
+        (demangled.size() == FunctionName.size() ||
+         demangled[FunctionName.size()] == '(')) {
       return mangled;
     }
   }

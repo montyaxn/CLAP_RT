@@ -174,15 +174,9 @@ static CompileResult compile_dsp(const std::filesystem::path &dsp_path) {
   }
 
   // Set up cache directory
-#ifdef _WIN32
-  if (const char *appdata = std::getenv("LOCALAPPDATA")) {
-    opts.cacheDir = (std::filesystem::path(appdata) / "rt-clap" / "cache").string();
-  }
-#else
   if (const char *home = std::getenv("HOME")) {
     opts.cacheDir = (std::filesystem::path(home) / ".cache" / "rt-clap").string();
   }
-#endif
 
   // Create JIT instance
   auto jit_or_err = clap_rt::ClapJIT::create(opts);
@@ -379,11 +373,7 @@ static bool plugin_init(const clap_plugin_t *plugin) {
     do_recompile(state);
   };
   state->gui_state.on_open_folder = []() {
-#ifdef _WIN32
-    std::string cmd = "explorer \"" + g_dsp_dir.string() + "\"";
-#else
     std::string cmd = "xdg-open \"" + g_dsp_dir.string() + "\" &";
-#endif
     std::system(cmd.c_str());
   };
   state->gui_state.on_param_changed = [state](int id, float value) {
@@ -837,19 +827,11 @@ static const clap_plugin_factory_t plugin_factory = {
 static bool entry_init(const char *path) {
   (void)path;
 
-#ifdef _WIN32
-  // Windows: Use %APPDATA%\rt-clap
-  const char *appdata = getenv("APPDATA");
-  if (!appdata)
-    return false;
-  g_dsp_dir = std::filesystem::path(appdata) / "rt-clap";
-#else
-  // Linux/macOS: Use ~/.local/share/rt-clap
+  // Use ~/.local/share/rt-clap
   const char *home = getenv("HOME");
   if (!home)
     return false;
   g_dsp_dir = std::filesystem::path(home) / ".local" / "share" / "rt-clap";
-#endif
 
   // Create directory if it doesn't exist
   std::error_code ec;
