@@ -17,6 +17,7 @@ enum class LangStandard { CXX14, CXX17, CXX20 };
 struct JITOptions {
   LangStandard langStandard = LangStandard::CXX20;
   std::string targetTriple; // empty = auto-detect
+  std::vector<std::string> includePaths; // additional include directories
 };
 
 class ClapJIT {

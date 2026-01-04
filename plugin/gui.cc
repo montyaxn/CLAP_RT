@@ -46,11 +46,12 @@ void scan_dsp_files(PluginGui *gui, const char *dir) {
   std::error_code ec;
   std::filesystem::path base_dir(dir);
 
-  // Scan each subdirectory (local/, @username/, etc.)
+  // Scan each subdirectory (local/, @username/, etc.) but skip lib/
   for (const auto &subdir : std::filesystem::directory_iterator(base_dir, ec)) {
     if (!subdir.is_directory()) continue;
 
     std::string folder_name = subdir.path().filename().string();
+    if (folder_name == "lib") continue;  // lib/ is for shared code, not DSP files
 
     for (const auto &file : std::filesystem::directory_iterator(subdir.path(), ec)) {
       if (file.path().extension() == ".cc") {

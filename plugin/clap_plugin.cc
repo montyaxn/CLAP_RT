@@ -89,7 +89,21 @@ static void log_compile(const std::string &msg) {
   }
 }
 
+/// Scans lib/ folder and returns list of .cc files
+static std::vector<std::string> get_lib_sources() {
+  std::vector<std::string> sources;
+  auto lib_dir = g_dsp_dir / "lib";
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(lib_dir, ec)) {
+    if (entry.path().extension() == ".cc") {
+      sources.push_back(entry.path().string());
+    }
+  }
+  return sources;
+}
+
 /// Recompiles the DSP code from the selected file in ~/.local/share/rt-clap/.
+/// Also compiles any .cc files in lib/ folder.
 /// Updates GUI state with success/error status.
 /// Uses atomic swap to safely update the process function pointer.
 static void do_recompile(PluginState *state) {
@@ -97,10 +111,17 @@ static void do_recompile(PluginState *state) {
   state->gui_state.compile_success = false;
 
   auto dsp_path = g_dsp_dir / get_selected_dsp_file(state);
+  auto lib_dir = g_dsp_dir / "lib";
   log_compile("Compiling: " + dsp_path.string());
 
+  // Set up JIT options with lib/ as include path
+  clap_rt::JITOptions opts;
+  if (std::filesystem::exists(lib_dir)) {
+    opts.includePaths.push_back(lib_dir.string());
+  }
+
   // Create fresh JIT instance
-  auto jit_or_err = clap_rt::ClapJIT::create();
+  auto jit_or_err = clap_rt::ClapJIT::create(opts);
   if (!jit_or_err) {
     state->gui_state.last_error = llvm::toString(jit_or_err.takeError());
     log_compile("JIT create error: " + state->gui_state.last_error);
@@ -108,6 +129,17 @@ static void do_recompile(PluginState *state) {
   }
 
   auto new_jit = std::make_unique<clap_rt::ClapJIT>(std::move(*jit_or_err));
+
+  // Compile lib/ sources first
+  for (const auto &lib_src : get_lib_sources()) {
+    log_compile("Compiling lib: " + lib_src);
+    auto err = new_jit->addModule(lib_src);
+    if (err) {
+      state->gui_state.last_error = llvm::toString(std::move(err));
+      log_compile("Lib compile error: " + state->gui_state.last_error);
+      return;
+    }
+  }
 
   // Compile DSP code
   auto err = new_jit->addModule(dsp_path.string());
@@ -163,13 +195,30 @@ static bool plugin_init(const clap_plugin_t *plugin) {
   // Initialize LLVM (safe to call multiple times)
   clap_rt::ClapJIT::initializeLLVM();
 
+  // Set up JIT options with lib/ as include path
+  auto lib_dir = g_dsp_dir / "lib";
+  clap_rt::JITOptions opts;
+  if (std::filesystem::exists(lib_dir)) {
+    opts.includePaths.push_back(lib_dir.string());
+  }
+
   // Create JIT instance
-  auto jit_or_err = clap_rt::ClapJIT::create();
+  auto jit_or_err = clap_rt::ClapJIT::create(opts);
   if (!jit_or_err) {
     log_compile("JIT create error: " + llvm::toString(jit_or_err.takeError()));
     return false;
   }
   state->jit = std::make_unique<clap_rt::ClapJIT>(std::move(*jit_or_err));
+
+  // Compile lib/ sources first
+  for (const auto &lib_src : get_lib_sources()) {
+    log_compile("Compiling lib: " + lib_src);
+    auto err = state->jit->addModule(lib_src);
+    if (err) {
+      log_compile("Lib compile error: " + llvm::toString(std::move(err)));
+      return false;
+    }
+  }
 
   // Compile DSP code
   auto dsp_path = g_dsp_dir / get_selected_dsp_file(state);

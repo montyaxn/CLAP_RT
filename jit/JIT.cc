@@ -5,6 +5,7 @@
 #include <clang/CodeGen/CodeGenAction.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <clang/Lex/HeaderSearchOptions.h>
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/Support/TargetSelect.h>
@@ -81,6 +82,12 @@ ClapJIT::compileSingleFile(llvm::StringRef FilePath, llvm::LLVMContext &Ctx) {
 
   CI.createFileManager();
   CI.createSourceManager();
+
+  // Add include paths
+  auto &HSO = CI.getInvocation().getHeaderSearchOpts();
+  for (const auto &path : options_.includePaths) {
+    HSO.AddPath(path, clang::frontend::Angled, false, true);
+  }
 
   auto &FrontendOpts = CI.getInvocation().getFrontendOpts();
   FrontendOpts.Inputs.clear();
